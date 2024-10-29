@@ -1,33 +1,20 @@
 import pandas as pd
 import numpy as np
-from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import TimeSeriesSplit
-from sklearn.metrics import mean_absolute_error, r2_score
-from sklearn.ensemble import GradientBoostingRegressor
-from sklearn.svm import SVR
-import seaborn as sns
 import matplotlib.pyplot as plt
-from datetime import datetime, timedelta
 
 class AirQualityPredictor:
     def __init__(self, forecast_horizon=5):
         self.forecast_horizon = forecast_horizon
         self.scalers = {}
-        self.models = {
-            'gbm': GradientBoostingRegressor(
-                n_estimators=100,
-                learning_rate=0.1,
-                max_depth=4,
-                random_state=42
-            ),
-            'svr': SVR(
-                kernel='rbf',
-                C=1.0,
-                epsilon=0.1
-            )
-        }
         self.feature_importance = None
+        self.models = {}
         
+    def standardize(self, x):
+        """Simple standardization (z-score normalization)"""
+        mean = np.mean(x)
+        std = np.std(x)
+        return (x - mean) / (std if std != 0 else 1), mean, std
+    
     def create_features(self, df):
         """Create time-based and statistical features."""
         df = df.copy()
@@ -35,7 +22,7 @@ class AirQualityPredictor:
         # Convert index to datetime if not already
         if not isinstance(df.index, pd.DatetimeIndex):
             df['timestamp'] = pd.date_range(
-                start=datetime.now() - timedelta(hours=len(df)-1),
+                start=pd.Timestamp.now() - pd.Timedelta(hours=len(df)-1),
                 periods=len(df),
                 freq='h'
             )
@@ -109,64 +96,131 @@ class AirQualityPredictor:
         return X, y
     
     def scale_features(self, X, training=True):
-        """Scale features using StandardScaler."""
+        """Scale features using standardization."""
         if training:
             self.scalers = {}
             X_scaled = pd.DataFrame(index=X.index)
             
             for column in X.columns:
-                self.scalers[column] = StandardScaler()
-                X_scaled[column] = self.scalers[column].fit_transform(X[[column]]).ravel()
+                scaled_values, mean, std = self.standardize(X[column].values)
+                self.scalers[column] = {'mean': mean, 'std': std}
+                X_scaled[column] = scaled_values
         else:
             X_scaled = pd.DataFrame(index=X.index)
             for column in X.columns:
                 if column in self.scalers:
-                    X_scaled[column] = self.scalers[column].transform(X[[column]]).ravel()
+                    mean = self.scalers[column]['mean']
+                    std = self.scalers[column]['std']
+                    X_scaled[column] = (X[column] - mean) / (std if std != 0 else 1)
                 else:
                     X_scaled[column] = X[column]
                     
         return X_scaled
     
-    def train(self, X, y):
-        """Train ensemble models."""
-        X_scaled = self.scale_features(X, training=True)
-        
-        for name, model in self.models.items():
-            print(f"Training {name}...")
-            model.fit(X_scaled, y)
+    class SimpleGBM:
+        """Simple Gradient Boosting implementation"""
+        def __init__(self, n_estimators=100, learning_rate=0.1, max_depth=3):
+            self.n_estimators = n_estimators
+            self.learning_rate = learning_rate
+            self.max_depth = max_depth
+            self.trees = []
+            self.feature_importances_ = None
             
-        # Store feature importance from GBM
+        def _calculate_residuals(self, y_true, y_pred):
+            return y_true - y_pred
+            
+        def fit(self, X, y):
+            self.feature_importances_ = np.zeros(X.shape[1])
+            y_pred = np.zeros_like(y)
+            
+            for _ in range(self.n_estimators):
+                residuals = self._calculate_residuals(y, y_pred)
+                tree = self._build_simple_tree(X, residuals)
+                self.trees.append(tree)
+                
+                # Update predictions
+                predictions = self._predict_tree(X, tree)
+                y_pred += self.learning_rate * predictions
+                
+                # Update feature importance
+                self.feature_importances_ += np.abs(tree['split_feature_importance'])
+                
+            # Normalize feature importance
+            self.feature_importances_ /= np.sum(self.feature_importances_)
+            
+        def _build_simple_tree(self, X, y):
+            """Build a very simple decision tree"""
+            best_feature = np.random.randint(0, X.shape[1])
+            split_value = np.median(X[:, best_feature])
+            
+            left_mask = X[:, best_feature] <= split_value
+            right_mask = ~left_mask
+            
+            tree = {
+                'feature': best_feature,
+                'split_value': split_value,
+                'left_pred': np.mean(y[left_mask]) if np.any(left_mask) else 0,
+                'right_pred': np.mean(y[right_mask]) if np.any(right_mask) else 0,
+                'split_feature_importance': np.zeros(X.shape[1])
+            }
+            
+            tree['split_feature_importance'][best_feature] = np.abs(tree['left_pred'] - tree['right_pred'])
+            
+            return tree
+            
+        def predict(self, X):
+            y_pred = np.zeros(X.shape[0])
+            
+            for tree in self.trees:
+                predictions = self._predict_tree(X, tree)
+                y_pred += self.learning_rate * predictions
+                
+            return y_pred
+            
+        def _predict_tree(self, X, tree):
+            predictions = np.zeros(X.shape[0])
+            mask = X[:, tree['feature']] <= tree['split_value']
+            predictions[mask] = tree['left_pred']
+            predictions[~mask] = tree['right_pred']
+            return predictions
+    
+    def train(self, X, y):
+        """Train model."""
+        X_scaled = self.scale_features(X, training=True)
+        X_array = X_scaled.values
+        
+        self.models['gbm'] = self.SimpleGBM()
+        print("Training GBM...")
+        self.models['gbm'].fit(X_array, y.values)
+        
+        # Store feature importance
         self.feature_importance = pd.DataFrame({
             'feature': X.columns,
             'importance': self.models['gbm'].feature_importances_
         }).sort_values('importance', ascending=False)
     
     def predict(self, X):
-        """Make ensemble predictions."""
+        """Make predictions."""
         X_scaled = self.scale_features(X, training=False)
-        predictions = {}
+        X_array = X_scaled.values
         
-        for name, model in self.models.items():
-            predictions[name] = model.predict(X_scaled)
-            
-        # Ensemble prediction (weighted average)
-        final_prediction = (0.7 * predictions['gbm'] + 0.3 * predictions['svr'])
-        return final_prediction, predictions
+        predictions = self.models['gbm'].predict(X_array)
+        return predictions
     
     def evaluate(self, X, y):
         """Evaluate model performance."""
-        final_pred, model_preds = self.predict(X)
+        predictions = self.predict(X)
         
-        results = {
-            'Ensemble MAE': mean_absolute_error(y, final_pred),
-            'Ensemble R2': r2_score(y, final_pred)
+        # Calculate metrics
+        mae = np.mean(np.abs(y - predictions))
+        mse = np.mean((y - predictions) ** 2)
+        r2 = 1 - (np.sum((y - predictions) ** 2) / np.sum((y - np.mean(y)) ** 2))
+        
+        return {
+            'MAE': mae,
+            'MSE': mse,
+            'R2': r2
         }
-        
-        for name, preds in model_preds.items():
-            results[f'{name} MAE'] = mean_absolute_error(y, preds)
-            results[f'{name} R2'] = r2_score(y, preds)
-            
-        return results
     
     def plot_feature_importance(self, top_n=10):
         """Plot top feature importance."""
@@ -176,10 +230,11 @@ class AirQualityPredictor:
             
         plt.figure(figsize=(12, 6))
         data = self.feature_importance.head(top_n)
-        sns.barplot(data=data, x='importance', y='feature')
+        plt.bar(data['feature'], data['importance'])
+        plt.xticks(rotation=45, ha='right')
         plt.title(f'Top {top_n} Most Important Features')
-        plt.xlabel('Importance')
-        plt.ylabel('Feature')
+        plt.xlabel('Feature')
+        plt.ylabel('Importance')
         plt.tight_layout()
         plt.show()
         
@@ -199,38 +254,12 @@ class AirQualityPredictor:
         plt.tight_layout()
         plt.show()
         
-    def plot_learning_curve(self, X_train, y_train):
-        """Plot learning curve of the Gradient Boosting model."""
-        from sklearn.model_selection import learning_curve
-        
-        train_sizes, train_scores, test_scores = learning_curve(
-            self.models['gbm'],
-            X_train,
-            y_train,
-            cv=5,
-            scoring='neg_mean_absolute_error',
-            train_sizes=np.linspace(0.1, 1.0, 10)
-        )
-        
-        train_scores_mean = -np.mean(train_scores, axis=1)
-        test_scores_mean = -np.mean(test_scores, axis=1)
-        
-        plt.figure(figsize=(10, 6))
-        plt.plot(train_sizes, train_scores_mean, label="Training error")
-        plt.plot(train_sizes, test_scores_mean, label="Cross-validation error")
-        plt.title("Learning Curve: Gradient Boosting")
-        plt.xlabel("Training Set Size")
-        plt.ylabel("Mean Absolute Error")
-        plt.legend()
-        plt.grid(True)
-        plt.show()
-    
     def plot_residuals(self, y_true, y_pred):
         """Plot residuals (errors) for predictions."""
         residuals = y_true - y_pred
         plt.figure(figsize=(10, 6))
         plt.scatter(y_pred, residuals, alpha=0.5)
-        plt.hlines(0, y_pred.min(), y_pred.max(), linestyles='dashed', colors='r')
+        plt.axhline(y=0, color='r', linestyle='--')
         plt.title("Residual Plot: Predicted vs Residuals")
         plt.xlabel("Predicted Values")
         plt.ylabel("Residuals (Actual - Predicted)")
@@ -253,7 +282,7 @@ class AirQualityPredictor:
         """Plot distribution of prediction errors (residuals)."""
         residuals = y_true - y_pred
         plt.figure(figsize=(10, 6))
-        sns.histplot(residuals, kde=True, color='purple')
+        plt.hist(residuals, bins=30, density=True, alpha=0.7)
         plt.title("Distribution of Prediction Errors (Residuals)")
         plt.xlabel("Residuals (Actual - Predicted)")
         plt.ylabel("Frequency")
@@ -264,7 +293,7 @@ class AirQualityPredictor:
 if __name__ == "__main__":
     # Load data
     print("Loading data...")
-    file_path = 'AirQualityUCI.xlsx'  # Ensure the file path is correct
+    file_path = 'AirQualityUCI.xlsx'
     data = pd.read_excel(file_path)
     
     # Initialize predictor
@@ -275,53 +304,29 @@ if __name__ == "__main__":
     print("Preparing data...")
     X, y = predictor.prepare_data(data)
     
-    # Initialize TimeSeriesSplit (this is the missing step)
-    print("Performing cross-validation...")
-    tscv = TimeSeriesSplit(n_splits=10)  # Ensure this initialization happens before the loop
+    # Simple time series split
+    train_size = int(len(X) * 0.8)
+    X_train, X_test = X[:train_size], X[train_size:]
+    y_train, y_test = y[:train_size], y[train_size:]
     
-    # Cross-validation loop
-    cv_results = []
-    for i, (train_idx, test_idx) in enumerate(tscv.split(X), 1):
-        print(f"\nFold {i}/10")
-        X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
-        y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
-        
-        # Train model
-        print("Training models...")
-        predictor.train(X_train, y_train)
-        
-        # Evaluate
-        print("Evaluating performance...")
-        results = predictor.evaluate(X_test, y_test)
-        cv_results.append(results)
-        
-        # Make predictions
-        final_pred, _ = predictor.predict(X_test)
-        
-        # Plot predictions for this fold
-        predictor.plot_predictions(
-            y_test,
-            final_pred,
-            title=f'Fold {i}: Actual vs Predicted Values (MAE: {results["Ensemble MAE"]:.3f})'
-        )
-        
-        # Plot residuals for this fold
-        predictor.plot_residuals(y_test, final_pred)
-        
-        # Plot time series of actual vs predicted
-        predictor.plot_time_series(y_test, final_pred, index=X_test.index)
-        
-        # Plot error distribution for this fold
-        predictor.plot_error_distribution(y_test, final_pred)
+    # Train model
+    print("Training models...")
+    predictor.train(X_train, y_train)
     
-    # Learning curve (optional: you can plot it once for the whole dataset)
-    predictor.plot_learning_curve(X_train, y_train)
+    # Make predictions
+    print("Making predictions...")
+    predictions = predictor.predict(X_test)
     
-    # Print average results
-    print("\nAverage Cross-validation Results:")
-    avg_results = pd.DataFrame(cv_results).mean()
-    for metric, value in avg_results.items():
+    # Evaluate
+    print("Evaluating performance...")
+    results = predictor.evaluate(X_test, y_test)
+    print("\nResults:")
+    for metric, value in results.items():
         print(f"{metric}: {value:.3f}")
     
-    # Plot feature importance
+    # Plot various visualizations
+    predictor.plot_predictions(y_test, predictions)
+    predictor.plot_residuals(y_test, predictions)
+    predictor.plot_time_series(y_test, predictions, X_test.index)
+    predictor.plot_error_distribution(y_test, predictions)
     predictor.plot_feature_importance()
